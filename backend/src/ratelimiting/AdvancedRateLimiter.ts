@@ -1,16 +1,19 @@
 import Redis from 'ioredis';
 import { EventEmitter } from 'events';
 import { WinstonLogger } from '../utils/logger';
+import { Request, Response, NextFunction } from 'express';
 
 export interface RateLimitConfig {
   windowMs: number;
   max: number;
-  keyGenerator?: (req: any) => string;
+  keyGenerator?: (req: Request) => string;
   skipSuccessfulRequests?: boolean;
   skipFailedRequests?: boolean;
-  onLimitReached?: (req: any, res: any) => void;
+  onLimitReached?: (req: Request, res: Response) => void;
   emergencyBypass?: boolean;
   dynamicAdjustment?: boolean;
+  warningThreshold?: number;
+  onWarning?: (req: Request, res: Response, remaining: number) => void;
 }
 
 export interface RateLimitResult {
@@ -19,6 +22,7 @@ export interface RateLimitResult {
   resetTime: number;
   totalHits: number;
   retryAfter?: number;
+  isWarning?: boolean;
 }
 
 export interface SystemMetrics {
@@ -52,8 +56,8 @@ export class AdvancedRateLimiter extends EventEmitter {
   async checkRateLimit(
     key: string,
     config: RateLimitConfig,
-    req?: any,
-    res?: any
+    req?: Request,
+    res?: Response
   ): Promise<RateLimitResult> {
     const now = Date.now();
     const windowStart = now - config.windowMs;
@@ -97,8 +101,17 @@ export class AdvancedRateLimiter extends EventEmitter {
       const remaining = Math.max(0, adjustedMax - totalHits);
       const resetTime = now + config.windowMs;
       
+      // Check warning threshold
+      const isWarning = config.warningThreshold && 
+                       remaining <= config.warningThreshold && 
+                       remaining > 0;
+      
       if (!allowed && config.onLimitReached && req && res) {
         config.onLimitReached(req, res);
+      }
+      
+      if (isWarning && config.onWarning && req && res) {
+        config.onWarning(req, res, remaining);
       }
       
       // Emit event for monitoring
@@ -108,7 +121,8 @@ export class AdvancedRateLimiter extends EventEmitter {
         totalHits,
         remaining,
         adjustedMax,
-        timestamp: now
+        timestamp: now,
+        isWarning
       });
       
       return {
@@ -116,7 +130,8 @@ export class AdvancedRateLimiter extends EventEmitter {
         remaining,
         resetTime,
         totalHits,
-        retryAfter: allowed ? undefined : Math.ceil(config.windowMs / 1000)
+        retryAfter: allowed ? undefined : Math.ceil(config.windowMs / 1000),
+        isWarning
       };
       
     } catch (error) {
@@ -261,5 +276,123 @@ export class AdvancedRateLimiter extends EventEmitter {
 
   async cleanup(): Promise<void> {
     await this.redis.quit();
+  }
+
+  public middleware(config: RateLimitConfig) {
+    return async (req: Request, res: Response, next: NextFunction) => {
+      const key = config.keyGenerator ? config.keyGenerator(req) : this.generateKey(req);
+      
+      try {
+        const result = await this.checkRateLimit(key, config, req, res);
+        
+        // Set rate limit headers
+        res.set({
+          'X-RateLimit-Limit': config.max.toString(),
+          'X-RateLimit-Remaining': result.remaining.toString(),
+          'X-RateLimit-Reset': Math.ceil(result.resetTime / 1000).toString(),
+          'X-RateLimit-Window': config.windowMs.toString()
+        });
+        
+        if (!result.allowed) {
+          return res.status(429).json({
+            error: 'Too Many Requests',
+            message: 'Rate limit exceeded. Please try again later.',
+            retryAfter: result.retryAfter,
+            limit: config.max,
+            windowMs: config.windowMs,
+            resetTime: new Date(result.resetTime)
+          });
+        }
+        
+        next();
+      } catch (error) {
+        this.logger.error('Rate limiter middleware error', { error });
+        next(); // Fail open
+      }
+    };
+  }
+
+  private generateKey(req: Request): string {
+    const user = (req as any).user;
+    if (user?.id) {
+      return `rate_limit:user:${user.id}`;
+    }
+    return `rate_limit:ip:${req.ip}`;
+  }
+
+  public async getActiveKeys(): Promise<string[]> {
+    try {
+      return await this.redis.keys('rate_limit:*');
+    } catch (error) {
+      this.logger.error('Failed to get active keys', { error });
+      return [];
+    }
+  }
+
+  public async getKeyStats(key: string): Promise<{
+    currentHits: number;
+    oldestRequest?: number;
+    newestRequest?: number;
+    ttl: number;
+  }> {
+    try {
+      const pipeline = this.redis.pipeline();
+      pipeline.zcard(key);
+      pipeline.zrange(key, 0, 0, 'WITHSCORES');
+      pipeline.zrange(key, -1, -1, 'WITHSCORES');
+      pipeline.ttl(key);
+      
+      const results = await pipeline.exec();
+      const currentHits = results?.[0]?.[1] as number || 0;
+      const oldestResult = results?.[1]?.[1] as string[] || [];
+      const newestResult = results?.[2]?.[1] as string[] || [];
+      const ttl = results?.[3]?.[1] as number || -1;
+      
+      const oldestRequest = oldestResult.length > 1 ? parseInt(oldestResult[1]) : undefined;
+      const newestRequest = newestResult.length > 1 ? parseInt(newestResult[1]) : undefined;
+      
+      return {
+        currentHits,
+        oldestRequest,
+        newestRequest,
+        ttl
+      };
+    } catch (error) {
+      this.logger.error('Failed to get key stats', { key, error });
+      return {
+        currentHits: 0,
+        ttl: -1
+      };
+    }
+  }
+
+  public async resetKey(key: string): Promise<void> {
+    try {
+      await this.redis.del(key);
+      this.logger.info('Rate limit key reset', { key });
+    } catch (error) {
+      this.logger.error('Failed to reset key', { key, error });
+    }
+  }
+
+  public async cleanupExpiredKeys(): Promise<number> {
+    try {
+      const keys = await this.redis.keys('rate_limit:*');
+      let deletedCount = 0;
+      
+      for (const key of keys) {
+        const ttl = await this.redis.ttl(key);
+        if (ttl === -1) { // No expiration set
+          await this.redis.expire(key, 900); // Set 15 minutes
+        } else if (ttl === -2) { // Key doesn't exist
+          deletedCount++;
+        }
+      }
+      
+      return deletedCount;
+    } catch (error) {
+      this.logger.error('Failed to cleanup expired keys', { error });
+      return 0;
+    }
   }
 }

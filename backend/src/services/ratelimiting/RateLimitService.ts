@@ -1,8 +1,10 @@
+import { Request, Response, NextFunction } from 'express';
 import { AdvancedRateLimiter } from '../../ratelimiting/AdvancedRateLimiter';
 import { UserRateLimiter, UserRateLimitConfig, UserRateLimitStatus } from '../../ratelimiting/UserRateLimiter';
 import { TieredRateLimiter, UserTier, UserTierInfo, TierConfig } from '../../ratelimiting/TieredRateLimiter';
 import { DynamicRateLimiter, DynamicAdjustmentRule, LoadBalancingConfig } from '../../ratelimiting/DynamicRateLimiter';
 import { WinstonLogger } from '../../utils/logger';
+import { EventEmitter } from 'events';
 
 export interface RateLimitServiceConfig {
   redisUrl?: string;
@@ -71,7 +73,7 @@ export interface RateLimitNotification {
   timestamp: number;
 }
 
-export class RateLimitService {
+export class RateLimitService extends EventEmitter {
   private advancedLimiter: AdvancedRateLimiter;
   private userRateLimiter: UserRateLimiter;
   private tieredRateLimiter: TieredRateLimiter;
@@ -82,6 +84,7 @@ export class RateLimitService {
   private emergencyMode: boolean = false;
 
   constructor(config: RateLimitServiceConfig) {
+    super();
     this.config = config;
     this.logger = new WinstonLogger();
     
@@ -510,5 +513,111 @@ export class RateLimitService {
   async cleanup(): Promise<void> {
     await this.advancedLimiter.cleanup();
     this.logger.info('Rate limit service cleaned up');
+  }
+
+  // Middleware factory methods
+  public createMiddleware(options: {
+    endpoint?: string;
+    enableUserRateLimiting?: boolean;
+    enableTieredRateLimiting?: boolean;
+    enableDynamicAdjustment?: boolean;
+  } = {}) {
+    return async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const user = (req as any).user;
+        const userId = user?.id;
+        const endpoint = options.endpoint || req.path;
+
+        const result = await this.checkRateLimit(userId, endpoint, req, res);
+
+        // Set rate limit headers
+        res.set({
+          'X-RateLimit-Limit': result.limits.minute.limit,
+          'X-RateLimit-Remaining': Math.max(0, result.limits.minute.limit - result.limits.minute.used).toString(),
+          'X-RateLimit-Reset': Math.ceil(result.limits.minute.resetTime / 1000).toString(),
+          'X-RateLimit-Type': result.tier ? 'tiered' : 'basic'
+        });
+
+        if (result.tier) {
+          res.set('X-RateLimit-Tier', result.tier);
+        }
+
+        if (result.adjustmentReason) {
+          res.set('X-RateLimit-Adjustment-Reason', result.adjustmentReason);
+        }
+
+        if (!result.allowed) {
+          return res.status(429).json({
+            error: 'Too Many Requests',
+            message: 'Rate limit exceeded. Please try again later.',
+            retryAfter: result.retryAfter,
+            limit: result.limits.minute.limit,
+            resetTime: new Date(result.limits.minute.resetTime),
+            tier: result.tier
+          });
+        }
+
+        next();
+      } catch (error) {
+        this.logger.error('Rate limit middleware error', { error });
+        next(); // Fail open
+      }
+    };
+  }
+
+  // API methods for external consumption
+  public async getRateLimitStatus(userId?: string): Promise<any> {
+    if (!userId) {
+      return { error: 'User ID required' };
+    }
+
+    const userStatus = await this.getUserRateLimitStatus(userId);
+    const tierInfo = this.tieredRateLimiter.getUserTier(userId);
+    
+    return {
+      userId,
+      userStatus,
+      tier: tierInfo?.tier,
+      emergencyMode: this.emergencyMode
+    };
+  }
+
+  public async setRateLimits(userId: string, limits: {
+    requestsPerMinute?: number;
+    requestsPerHour?: number;
+    requestsPerDay?: number;
+  }): Promise<void> {
+    const config: UserRateLimitConfig = {
+      userId,
+      tier: UserTier.CUSTOM,
+      baseLimits: {
+        requestsPerMinute: limits.requestsPerMinute || this.config.defaultLimits.requestsPerMinute,
+        requestsPerHour: limits.requestsPerHour || this.config.defaultLimits.requestsPerHour,
+        requestsPerDay: limits.requestsPerDay || this.config.defaultLimits.requestsPerDay,
+        requestsPerMonth: this.config.defaultLimits.requestsPerDay * 30
+      }
+    };
+
+    this.setUserRateLimitConfig(config);
+  }
+
+  public async getSystemMetrics(): Promise<any> {
+    return {
+      health: await this.healthCheck(),
+      analytics: await this.getAnalytics(),
+      notifications: this.getNotifications(),
+      config: this.getConfig()
+    };
+  }
+
+  public async createRateLimitAlert(type: RateLimitNotification['type'], data: any): Promise<void> {
+    this.addNotification({
+      type,
+      userId: data.userId,
+      message: data.message || `Rate limit ${type} triggered`,
+      severity: data.severity || 'medium',
+      data,
+      timestamp: Date.now()
+    });
   }
 }

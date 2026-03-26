@@ -1,22 +1,37 @@
 import { AdvancedRateLimiter, RateLimitConfig, RateLimitResult } from './AdvancedRateLimiter';
 import { WinstonLogger } from '../utils/logger';
+import { Request, Response, NextFunction } from 'express';
 
 export interface UserRateLimitConfig {
   userId: string;
+  tier: 'free' | 'basic' | 'premium' | 'enterprise' | 'custom';
   baseLimits: {
     requestsPerMinute: number;
     requestsPerHour: number;
     requestsPerDay: number;
+    requestsPerMonth: number;
   };
   customLimits?: {
     [endpoint: string]: {
       requestsPerMinute: number;
       requestsPerHour: number;
       requestsPerDay: number;
+      requestsPerMonth: number;
     };
   };
-  bypassLimits?: boolean;
-  whitelist?: boolean;
+  specialFeatures?: {
+    burstMultiplier: number;
+    priorityMultiplier: number;
+    bypassLimits: boolean;
+    whitelist: boolean;
+  };
+  subscription?: {
+    planId: string;
+    status: 'active' | 'inactive' | 'cancelled' | 'expired';
+    startDate: Date;
+    endDate: Date;
+    autoRenew: boolean;
+  };
 }
 
 export interface UserRateLimitStatus {
@@ -62,17 +77,19 @@ export class UserRateLimiter {
     // Default config if none exists
     const defaultConfig: UserRateLimitConfig = {
       userId,
+      tier: 'free',
       baseLimits: {
         requestsPerMinute: 60,
         requestsPerHour: 1000,
-        requestsPerDay: 10000
+        requestsPerDay: 10000,
+        requestsPerMonth: 100000
       }
     };
     
     const userConfig = config || defaultConfig;
     
     // Check whitelist and bypass
-    if (userConfig.whitelist || userConfig.bypassLimits) {
+    if (userConfig.specialFeatures?.whitelist || userConfig.specialFeatures?.bypassLimits) {
       const status = await this.createStatus(userId, userConfig, true);
       return {
         allowed: true,
@@ -200,10 +217,12 @@ export class UserRateLimiter {
   async getUserRateLimitStatus(userId: string): Promise<UserRateLimitStatus> {
     const config = this.getUserConfig(userId) || {
       userId,
+      tier: 'free',
       baseLimits: {
         requestsPerMinute: 60,
         requestsPerHour: 1000,
-        requestsPerDay: 10000
+        requestsPerDay: 10000,
+        requestsPerMonth: 100000
       }
     };
 
@@ -252,8 +271,8 @@ export class UserRateLimiter {
         }
       },
       customLimitsActive: !!(config.customLimits && Object.keys(config.customLimits).length > 0),
-      whitelist: config.whitelist || false,
-      bypassLimits: config.bypassLimits || false
+      whitelist: config.specialFeatures?.whitelist || false,
+      bypassLimits: config.specialFeatures?.bypassLimits || false
     } as UserRateLimitStatus;
   }
 
@@ -321,5 +340,100 @@ export class UserRateLimiter {
 
   getAllUserConfigs(): UserRateLimitConfig[] {
     return Array.from(this.userConfigs.values());
+  }
+
+  public middleware(endpoint: string) {
+    return async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const user = (req as any).user;
+        if (!user?.id) {
+          return next(); // Skip rate limiting for unauthenticated requests
+        }
+
+        const result = await this.checkUserRateLimit(user.id, endpoint, req, res);
+
+        // Set rate limit headers
+        res.set({
+          'X-RateLimit-Limit': result.status.currentUsage.minute.limit,
+          'X-RateLimit-Remaining': (result.status.currentUsage.minute.limit - result.status.currentUsage.minute.used).toString(),
+          'X-RateLimit-Reset': Math.ceil(result.status.currentUsage.minute.resetTime / 1000).toString(),
+          'X-RateLimit-User-Tier': this.getUserConfig(user.id)?.tier || 'free',
+          'X-RateLimit-User-ID': user.id,
+          'X-RateLimit-Endpoint': endpoint
+        });
+
+        if (!result.allowed) {
+          return res.status(429).json({
+            error: 'Too Many Requests',
+            message: `Rate limit exceeded for user. Please try again later.`,
+            retryAfter: result.retryAfter,
+            userId: user.id,
+            endpoint,
+            resetTime: new Date(result.status.currentUsage.minute.resetTime)
+          });
+        }
+
+        next();
+      } catch (error) {
+        this.logger.error('User rate limiter middleware error', { error, endpoint });
+        next(); // Fail open
+      }
+    };
+  }
+
+  public async upgradeUserTier(userId: string, newTier: UserRateLimitConfig['tier']): Promise<void> {
+    const userConfig = this.getUserConfig(userId);
+    if (!userConfig) {
+      throw new Error(`User config not found for userId: ${userId}`);
+    }
+
+    const oldTier = userConfig.tier;
+    userConfig.tier = newTier;
+    this.setUserConfig(userConfig);
+
+    this.logger.info('User tier upgraded', { userId, oldTier, newTier });
+  }
+
+  public async setCustomLimits(
+    userId: string,
+    limits: UserRateLimitConfig['customLimits']
+  ): Promise<void> {
+    const userConfig = this.getUserConfig(userId) || {
+      userId,
+      tier: 'free',
+      baseLimits: {
+        requestsPerMinute: 60,
+        requestsPerHour: 1000,
+        requestsPerDay: 10000,
+        requestsPerMonth: 100000
+      }
+    };
+    userConfig.customLimits = limits;
+    this.setUserConfig(userConfig);
+  }
+
+  public async setUserSpecialFeatures(
+    userId: string,
+    features: Partial<UserRateLimitConfig['specialFeatures']>
+  ): Promise<void> {
+    const userConfig = this.getUserConfig(userId) || {
+      userId,
+      tier: 'free',
+      baseLimits: {
+        requestsPerMinute: 60,
+        requestsPerHour: 1000,
+        requestsPerDay: 10000,
+        requestsPerMonth: 100000
+      }
+    };
+    userConfig.specialFeatures = {
+      burstMultiplier: 1,
+      priorityMultiplier: 1,
+      bypassLimits: false,
+      whitelist: false,
+      ...userConfig.specialFeatures,
+      ...features
+    };
+    this.setUserConfig(userConfig);
   }
 }

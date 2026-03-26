@@ -1,5 +1,7 @@
 import { AdvancedRateLimiter, RateLimitConfig, RateLimitResult } from './AdvancedRateLimiter';
 import { WinstonLogger } from '../utils/logger';
+import { Request, Response, NextFunction } from 'express';
+import { EventEmitter } from 'events';
 
 export enum UserTier {
   FREE = 'free',
@@ -69,13 +71,14 @@ export interface TieredRateLimitResult {
   retryAfter?: number;
 }
 
-export class TieredRateLimiter {
+export class TieredRateLimiter extends EventEmitter {
   private advancedLimiter: AdvancedRateLimiter;
   private logger: WinstonLogger;
   private tierConfigs: Map<UserTier, TierConfig> = new Map();
   private userTiers: Map<string, UserTierInfo> = new Map();
 
   constructor(advancedLimiter: AdvancedRateLimiter) {
+    super();
     this.advancedLimiter = advancedLimiter;
     this.logger = new WinstonLogger();
     this.initializeDefaultTiers();
@@ -502,5 +505,85 @@ export class TieredRateLimiter {
   removeUserTier(userId: string): void {
     this.userTiers.delete(userId);
     this.logger.info('User tier removed', { userId });
+  }
+
+  public middleware(endpoint: string) {
+    return async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const user = (req as any).user;
+        if (!user?.id) {
+          return next(); // Skip rate limiting for unauthenticated requests
+        }
+
+        const result = await this.checkTieredRateLimit(user.id, endpoint, req, res);
+
+        // Set rate limit headers
+        res.set({
+          'X-RateLimit-Limit': result.limits.minute.limit,
+          'X-RateLimit-Remaining': (result.limits.minute.limit - result.limits.minute.used).toString(),
+          'X-RateLimit-Reset': Math.ceil(result.limits.minute.resetTime / 1000).toString(),
+          'X-RateLimit-Tier': result.tier,
+          'X-RateLimit-Features': JSON.stringify(result.features),
+          'X-RateLimit-Endpoint': endpoint
+        });
+
+        if (!result.allowed) {
+          return res.status(429).json({
+            error: 'Too Many Requests',
+            message: `Rate limit exceeded for ${result.tier} tier. Please try again later.`,
+            retryAfter: result.retryAfter,
+            tier: result.tier,
+            endpoint,
+            resetTime: new Date(result.limits.minute.resetTime),
+            upgradeUrl: `/api/billing/upgrade?from=${result.tier}`
+          });
+        }
+
+        next();
+      } catch (error) {
+        this.logger.error('Tiered rate limiter middleware error', { error, endpoint });
+        next(); // Fail open
+      }
+    };
+  }
+
+  public async getTierUsageStats(): Promise<{ [tier in UserTier]: { users: number; requests: number } }> {
+    const stats: { [tier in UserTier]: { users: number; requests: number } } = {
+      [UserTier.FREE]: { users: 0, requests: 0 },
+      [UserTier.BASIC]: { users: 0, requests: 0 },
+      [UserTier.PREMIUM]: { users: 0, requests: 0 },
+      [UserTier.ENTERPRISE]: { users: 0, requests: 0 },
+      [UserTier.CUSTOM]: { users: 0, requests: 0 }
+    };
+
+    // Count users per tier
+    for (const [userId, tierInfo] of this.userTiers.entries()) {
+      stats[tierInfo.tier].users++;
+      
+      // Get current usage for this user
+      const minuteKey = `rate_limit:tiered:${userId}:minute`;
+      const minuteStats = await this.advancedLimiter.getRateLimitStats(minuteKey);
+      stats[tierInfo.tier].requests += minuteStats.currentHits;
+    }
+
+    return stats;
+  }
+
+  public emitTierUpgradeEvent(userId: string, fromTier: UserTier, toTier: UserTier): void {
+    this.emit('tier_upgrade', {
+      userId,
+      fromTier,
+      toTier,
+      timestamp: new Date()
+    });
+  }
+
+  public emitTierViolationEvent(userId: string, tier: UserTier, endpoint: string): void {
+    this.emit('tier_violation', {
+      userId,
+      tier,
+      endpoint,
+      timestamp: new Date()
+    });
   }
 }

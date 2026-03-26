@@ -1,5 +1,7 @@
 import { AdvancedRateLimiter, RateLimitConfig, RateLimitResult, SystemMetrics } from './AdvancedRateLimiter';
 import { WinstonLogger } from '../utils/logger';
+import { Request, Response, NextFunction } from 'express';
+import { EventEmitter } from 'events';
 
 export interface DynamicAdjustmentRule {
   id: string;
@@ -53,7 +55,7 @@ export interface PredictionMetrics {
   }>;
 }
 
-export class DynamicRateLimiter {
+export class DynamicRateLimiter extends EventEmitter {
   private advancedLimiter: AdvancedRateLimiter;
   private logger: WinstonLogger;
   private adjustmentRules: Map<string, DynamicAdjustmentRule> = new Map();
@@ -70,6 +72,7 @@ export class DynamicRateLimiter {
   }> = [];
 
   constructor(advancedLimiter: AdvancedRateLimiter) {
+    super();
     this.advancedLimiter = advancedLimiter;
     this.logger = new WinstonLogger();
     this.currentMetrics = {
@@ -618,5 +621,104 @@ export class DynamicRateLimiter {
 
     // Lower variance = higher efficiency
     return Math.max(0, 1 - (variance / (avgLoad * avgLoad)));
+  }
+
+  public middleware(baseLimits: {
+    requestsPerMinute: number;
+    requestsPerHour: number;
+    requestsPerDay: number;
+  }, key: string = 'default') {
+    return async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const result = await this.checkDynamicRateLimit(key, baseLimits, {
+          endpoint: req.path,
+          method: req.method,
+          userAgent: req.get('User-Agent')
+        }, req, res);
+
+        // Set rate limit headers
+        res.set({
+          'X-RateLimit-Limit': result.adjustedLimits.requestsPerMinute,
+          'X-RateLimit-Remaining': Math.max(0, result.adjustedLimits.requestsPerMinute - result.systemLoad.requestRate).toString(),
+          'X-RateLimit-Reset': Math.ceil(Date.now() / 1000 + 60).toString(),
+          'X-RateLimit-Adjusted': 'true',
+          'X-RateLimit-Reason': result.adjustmentReason,
+          'X-RateLimit-System-Load': JSON.stringify(result.systemLoad)
+        });
+
+        if (!result.allowed) {
+          return res.status(429).json({
+            error: 'Too Many Requests',
+            message: 'Dynamic rate limit exceeded. System is currently under load.',
+            retryAfter: result.retryAfter,
+            adjustedLimits: result.adjustedLimits,
+            adjustmentReason: result.adjustmentReason,
+            systemLoad: result.systemLoad,
+            appliedRules: result.appliedRules
+          });
+        }
+
+        next();
+      } catch (error) {
+        this.logger.error('Dynamic rate limiter middleware error', { error, key });
+        next(); // Fail open
+      }
+    };
+  }
+
+  public enableEmergencyMode(): void {
+    this.addAdjustmentRule({
+      id: 'emergency-mode-override',
+      name: 'Emergency Mode Override',
+      description: 'Emergency mode activated by administrator',
+      condition: () => true,
+      adjustment: (limits) => ({
+        ...limits,
+        requestsPerMinute: Math.floor(limits.requestsPerMinute * 0.1),
+        requestsPerHour: Math.floor(limits.requestsPerHour * 0.2),
+        requestsPerDay: Math.floor(limits.requestsPerDay * 0.3)
+      }),
+      priority: -1,
+      enabled: true
+    });
+
+    this.emit('emergency_mode_enabled', { timestamp: Date.now() });
+    this.logger.warn('Emergency mode enabled');
+  }
+
+  public disableEmergencyMode(): void {
+    this.removeAdjustmentRule('emergency-mode-override');
+    this.emit('emergency_mode_disabled', { timestamp: Date.now() });
+    this.logger.info('Emergency mode disabled');
+  }
+
+  public getSystemHealth(): {
+    status: 'healthy' | 'warning' | 'critical';
+    metrics: SystemMetrics;
+    activeRules: string[];
+    recommendations: string[];
+  } {
+    const { cpuUsage, memoryUsage, requestRate } = this.currentMetrics;
+    let status: 'healthy' | 'warning' | 'critical' = 'healthy';
+    const recommendations: string[] = [];
+
+    if (cpuUsage > 90 || memoryUsage > 0.95) {
+      status = 'critical';
+      recommendations.push('System is under critical load - consider scaling');
+    } else if (cpuUsage > 70 || memoryUsage > 0.8) {
+      status = 'warning';
+      recommendations.push('System load is high - monitor closely');
+    }
+
+    const activeRules = Array.from(this.adjustmentRules.values())
+      .filter(rule => rule.enabled)
+      .map(rule => rule.id);
+
+    return {
+      status,
+      metrics: this.currentMetrics,
+      activeRules,
+      recommendations
+    };
   }
 }

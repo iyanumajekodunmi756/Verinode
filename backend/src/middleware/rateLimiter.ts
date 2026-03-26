@@ -1,238 +1,330 @@
 import rateLimit from 'express-rate-limit';
-import { Request, Response } from 'express';
+import { Request, Response, NextFunction } from 'express';
+import { RateLimitService } from '../services/ratelimiting/RateLimitService';
+import { UserTier } from '../ratelimiting/TieredRateLimiter';
 
 /**
- * Rate limiting configuration for different endpoints
+ * Enhanced Rate limiting configuration for different endpoints
+ * Integrates with the advanced rate limiting service
  */
 
-// General rate limiter for most endpoints
-export const generalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per windowMs
-  message: {
-    error: 'Too many requests',
-    message: 'Rate limit exceeded. Please try again later.',
-    retryAfter: '15 minutes'
-  },
-  standardHeaders: true,
-  legacyHeaders: false,
-  handler: (req: Request, res: Response) => {
-    res.status(429).json({
-      error: 'Too many requests',
-      message: 'Rate limit exceeded. Please try again later.',
-      retryAfter: '15 minutes',
-      limit: 100,
-      windowMs: 15 * 60 * 1000
+// Global rate limit service instance
+let rateLimitService: RateLimitService | null = null;
+
+// Initialize the rate limit service
+export const initializeRateLimitService = (service: RateLimitService) => {
+  rateLimitService = service;
+};
+
+// Enhanced rate limiter with service integration
+const createEnhancedLimiter = (options: {
+  windowMs?: number;
+  max?: number;
+  endpoint?: string;
+  enableUserRateLimiting?: boolean;
+  enableTieredRateLimiting?: boolean;
+  enableDynamicAdjustment?: boolean;
+  skipSuccessfulRequests?: boolean;
+  skipFailedRequests?: boolean;
+}) => {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    // If rate limit service is available, use it
+    if (rateLimitService) {
+      try {
+        const user = (req as any).user;
+        const userId = user?.id;
+        
+        const result = await rateLimitService.checkRateLimit(userId, options.endpoint || req.path, req, res);
+        
+        // Set comprehensive rate limit headers
+        res.set({
+          'X-RateLimit-Limit': result.limits.minute.limit,
+          'X-RateLimit-Remaining': Math.max(0, result.limits.minute.limit - result.limits.minute.used).toString(),
+          'X-RateLimit-Reset': Math.ceil(result.limits.minute.resetTime / 1000).toString(),
+          'X-RateLimit-Window': '60000', // 1 minute window
+          'X-RateLimit-Service': 'enhanced'
+        });
+
+        if (result.tier) {
+          res.set('X-RateLimit-Tier', result.tier);
+        }
+
+        if (result.adjustmentReason) {
+          res.set('X-RateLimit-Adjustment-Reason', result.adjustmentReason);
+        }
+
+        if (result.features) {
+          res.set('X-RateLimit-Features', JSON.stringify(result.features));
+        }
+
+        if (!result.allowed) {
+          const statusCode = getStatusCodeForViolation(result);
+          return res.status(statusCode).json({
+            error: 'Too Many Requests',
+            message: getErrorMessageForViolation(result, options.endpoint || req.path),
+            retryAfter: result.retryAfter,
+            limit: result.limits.minute.limit,
+            windowMs: 60000,
+            resetTime: new Date(result.limits.minute.resetTime),
+            tier: result.tier,
+            upgradeUrl: result.tier ? `/api/billing/upgrade?from=${result.tier}` : undefined,
+            violationType: getViolationType(result)
+          });
+        }
+
+        return next();
+      } catch (error) {
+        console.error('Enhanced rate limiter error:', error);
+        // Fall back to basic rate limiting
+      }
+    }
+
+    // Fallback to basic express-rate-limit
+    const basicLimiter = rateLimit({
+      windowMs: options.windowMs || 15 * 60 * 1000, // 15 minutes
+      max: options.max || 100,
+      skipSuccessfulRequests: options.skipSuccessfulRequests || false,
+      skipFailedRequests: options.skipFailedRequests || false,
+      standardHeaders: true,
+      legacyHeaders: false,
+      handler: (req: Request, res: Response) => {
+        res.status(429).json({
+          error: 'Too Many Requests',
+          message: 'Rate limit exceeded. Please try again later.',
+          retryAfter: '15 minutes',
+          limit: options.max || 100,
+          windowMs: options.windowMs || 15 * 60 * 1000,
+          service: 'basic'
+        });
+      }
     });
+
+    return basicLimiter(req, res, next);
+  };
+};
+
+// Helper functions for enhanced error handling
+const getStatusCodeForViolation = (result: any): number => {
+  if (result.tier === UserTier.ENTERPRISE) {
+    return 429; // Still 429 but with different context
   }
+  if (result.violations?.count > 5) {
+    return 429;
+  }
+  return 429;
+};
+
+const getErrorMessageForViolation = (result: any, endpoint: string): string => {
+  const baseMessage = 'Rate limit exceeded. Please try again later.';
+  
+  if (result.tier) {
+    return `${baseMessage} Current tier: ${result.tier}. Consider upgrading for higher limits.`;
+  }
+  
+  if (result.adjustmentReason) {
+    return `${baseMessage} System is currently under load: ${result.adjustmentReason}`;
+  }
+  
+  return baseMessage;
+};
+
+const getViolationType = (result: any): string => {
+  if (result.adjustmentReason) {
+    return 'dynamic_adjustment';
+  }
+  if (result.tier) {
+    return 'tier_limit';
+  }
+  return 'basic_limit';
+};
+
+// General rate limiter for most endpoints
+export const generalLimiter = createEnhancedLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  endpoint: 'general',
+  enableUserRateLimiting: true,
+  enableTieredRateLimiting: true,
+  enableDynamicAdjustment: true
 });
 
 // Strict rate limiter for sensitive operations
-export const strictLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 20, // Limit each IP to 20 requests per windowMs
-  message: {
-    error: 'Too many requests',
-    message: 'Rate limit exceeded for this operation. Please try again later.',
-    retryAfter: '15 minutes'
-  },
-  standardHeaders: true,
-  legacyHeaders: false,
-  handler: (req: Request, res: Response) => {
-    res.status(429).json({
-      error: 'Too many requests',
-      message: 'Rate limit exceeded for this operation. Please try again later.',
-      retryAfter: '15 minutes',
-      limit: 20,
-      windowMs: 15 * 60 * 1000
-    });
-  }
+export const strictLimiter = createEnhancedLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  endpoint: 'strict',
+  enableUserRateLimiting: true,
+  enableTieredRateLimiting: true,
+  enableDynamicAdjustment: false // Disable dynamic for sensitive operations
 });
 
 // Proof creation rate limiter
-export const proofCreationLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, // 1 hour
-  max: 50, // Limit each IP to 50 proof creations per hour
-  message: {
-    error: 'Too many proof creations',
-    message: 'Proof creation limit exceeded. Please try again later.',
-    retryAfter: '1 hour'
-  },
-  keyGenerator: (req: Request) => {
-    // Use user ID if available, otherwise IP
-    return (req as any).user?.id || req.ip;
-  },
-  handler: (req: Request, res: Response) => {
-    res.status(429).json({
-      error: 'Too many proof creations',
-      message: 'Proof creation limit exceeded. Please try again later.',
-      retryAfter: '1 hour',
-      limit: 50,
-      windowMs: 60 * 60 * 1000
-    });
-  }
+export const proofCreationLimiter = createEnhancedLimiter({
+  windowMs: 60 * 60 * 1000,
+  max: 50,
+  endpoint: 'proof-creation',
+  enableUserRateLimiting: true,
+  enableTieredRateLimiting: true,
+  enableDynamicAdjustment: true
 });
 
 // Proof verification rate limiter
-export const verificationLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 30, // Limit each IP to 30 verifications per 15 minutes
-  message: {
-    error: 'Too many verification requests',
-    message: 'Verification limit exceeded. Please try again later.',
-    retryAfter: '15 minutes'
-  },
-  keyGenerator: (req: Request) => {
-    return (req as any).user?.id || req.ip;
-  },
-  handler: (req: Request, res: Response) => {
-    res.status(429).json({
-      error: 'Too many verification requests',
-      message: 'Verification limit exceeded. Please try again later.',
-      retryAfter: '15 minutes',
-      limit: 30,
-      windowMs: 15 * 60 * 1000
-    });
-  }
+export const verificationLimiter = createEnhancedLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  endpoint: 'verification',
+  enableUserRateLimiting: true,
+  enableTieredRateLimiting: true,
+  enableDynamicAdjustment: true
 });
 
 // Proof update rate limiter
-export const proofUpdateLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 updates per 15 minutes
-  message: {
-    error: 'Too many update requests',
-    message: 'Update limit exceeded. Please try again later.',
-    retryAfter: '15 minutes'
-  },
-  keyGenerator: (req: Request) => {
-    return (req as any).user?.id || req.ip;
-  },
-  handler: (req: Request, res: Response) => {
-    res.status(429).json({
-      error: 'Too many update requests',
-      message: 'Update limit exceeded. Please try again later.',
-      retryAfter: '15 minutes',
-      limit: 100,
-      windowMs: 15 * 60 * 1000
-    });
-  }
+export const proofUpdateLimiter = createEnhancedLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  endpoint: 'proof-update',
+  enableUserRateLimiting: true,
+  enableTieredRateLimiting: true,
+  enableDynamicAdjustment: true
 });
 
 // Proof deletion rate limiter
-export const proofDeletionLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, // 1 hour
-  max: 20, // Limit each IP to 20 deletions per hour
-  message: {
-    error: 'Too many deletion requests',
-    message: 'Deletion limit exceeded. Please try again later.',
-    retryAfter: '1 hour'
-  },
-  keyGenerator: (req: Request) => {
-    return (req as any).user?.id || req.ip;
-  },
-  handler: (req: Request, res: Response) => {
-    res.status(429).json({
-      error: 'Too many deletion requests',
-      message: 'Deletion limit exceeded. Please try again later.',
-      retryAfter: '1 hour',
-      limit: 20,
-      windowMs: 60 * 60 * 1000
-    });
-  }
+export const proofDeletionLimiter = createEnhancedLimiter({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  endpoint: 'proof-deletion',
+  enableUserRateLimiting: true,
+  enableTieredRateLimiting: true,
+  enableDynamicAdjustment: false // Disable dynamic for destructive operations
 });
 
 // Batch operations rate limiter
-export const batchLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, // 1 hour
-  max: 10, // Limit each IP to 10 batch operations per hour
-  message: {
-    error: 'Too many batch operations',
-    message: 'Batch operation limit exceeded. Please try again later.',
-    retryAfter: '1 hour'
-  },
-  keyGenerator: (req: Request) => {
-    return (req as any).user?.id || req.ip;
-  },
-  handler: (req: Request, res: Response) => {
-    res.status(429).json({
-      error: 'Too many batch operations',
-      message: 'Batch operation limit exceeded. Please try again later.',
-      retryAfter: '1 hour',
-      limit: 10,
-      windowMs: 60 * 60 * 1000
-    });
-  }
+export const batchLimiter = createEnhancedLimiter({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  endpoint: 'batch-operations',
+  enableUserRateLimiting: true,
+  enableTieredRateLimiting: true,
+  enableDynamicAdjustment: false
 });
 
 // Search rate limiter
-export const searchLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 50, // Limit each IP to 50 searches per 15 minutes
-  message: {
-    error: 'Too many search requests',
-    message: 'Search limit exceeded. Please try again later.',
-    retryAfter: '15 minutes'
-  },
-  keyGenerator: (req: Request) => {
-    return (req as any).user?.id || req.ip;
-  },
-  handler: (req: Request, res: Response) => {
-    res.status(429).json({
-      error: 'Too many search requests',
-      message: 'Search limit exceeded. Please try again later.',
-      retryAfter: '15 minutes',
-      limit: 50,
-      windowMs: 15 * 60 * 1000
-    });
-  }
+export const searchLimiter = createEnhancedLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 50,
+  endpoint: 'search',
+  enableUserRateLimiting: true,
+  enableTieredRateLimiting: true,
+  enableDynamicAdjustment: true
 });
 
 // Export rate limiter
-export const exportLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, // 1 hour
-  max: 5, // Limit each IP to 5 exports per hour
-  message: {
-    error: 'Too many export requests',
-    message: 'Export limit exceeded. Please try again later.',
-    retryAfter: '1 hour'
-  },
-  keyGenerator: (req: Request) => {
-    return (req as any).user?.id || req.ip;
-  },
-  handler: (req: Request, res: Response) => {
-    res.status(429).json({
-      error: 'Too many export requests',
-      message: 'Export limit exceeded. Please try again later.',
-      retryAfter: '1 hour',
-      limit: 5,
-      windowMs: 60 * 60 * 1000
-    });
-  }
+export const exportLimiter = createEnhancedLimiter({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  endpoint: 'export',
+  enableUserRateLimiting: true,
+  enableTieredRateLimiting: true,
+  enableDynamicAdjustment: false
 });
 
 // Sharing rate limiter
-export const sharingLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, // 1 hour
-  max: 25, // Limit each IP to 25 shares per hour
-  message: {
-    error: 'Too many sharing requests',
-    message: 'Sharing limit exceeded. Please try again later.',
-    retryAfter: '1 hour'
-  },
-  keyGenerator: (req: Request) => {
-    return (req as any).user?.id || req.ip;
-  },
-  handler: (req: Request, res: Response) => {
-    res.status(429).json({
-      error: 'Too many sharing requests',
-      message: 'Sharing limit exceeded. Please try again later.',
-      retryAfter: '1 hour',
-      limit: 25,
-      windowMs: 60 * 60 * 1000
-    });
-  }
+export const sharingLimiter = createEnhancedLimiter({
+  windowMs: 60 * 60 * 1000,
+  max: 25,
+  endpoint: 'sharing',
+  enableUserRateLimiting: true,
+  enableTieredRateLimiting: true,
+  enableDynamicAdjustment: true
 });
+
+// API endpoint rate limiter (for external API access)
+export const apiLimiter = createEnhancedLimiter({
+  windowMs: 60 * 1000,
+  max: 1000,
+  endpoint: 'api',
+  enableUserRateLimiting: true,
+  enableTieredRateLimiting: true,
+  enableDynamicAdjustment: true
+});
+
+// Webhook rate limiter
+export const webhookLimiter = createEnhancedLimiter({
+  windowMs: 60 * 1000,
+  max: 100,
+  endpoint: 'webhook',
+  enableUserRateLimiting: true,
+  enableTieredRateLimiting: true,
+  enableDynamicAdjustment: false
+});
+
+// Authentication rate limiter (for login attempts)
+export const authLimiter = createEnhancedLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  endpoint: 'auth',
+  enableUserRateLimiting: false, // Don't use user-based for auth
+  enableTieredRateLimiting: false,
+  enableDynamicAdjustment: false
+});
+
+// Password reset rate limiter
+export const passwordResetLimiter = createEnhancedLimiter({
+  windowMs: 60 * 60 * 1000,
+  max: 3,
+  endpoint: 'password-reset',
+  enableUserRateLimiting: false,
+  enableTieredRateLimiting: false,
+  enableDynamicAdjustment: false
+});
+
+// Dynamic rate limiter based on user tier (enhanced version)
+export const createDynamicLimiter = (baseLimit: number, windowMs: number, endpoint: string = 'custom') => {
+  return createEnhancedLimiter({
+    windowMs,
+    max: baseLimit,
+    endpoint,
+    enableUserRateLimiting: true,
+    enableTieredRateLimiting: true,
+    enableDynamicAdjustment: true
+  });
+};
+
+// Create rate limiters for different user tiers (enhanced)
+export const userTierLimiters = {
+  free: createEnhancedLimiter({
+    windowMs: 15 * 60 * 1000,
+    max: 50,
+    endpoint: 'free-tier',
+    enableUserRateLimiting: true,
+    enableTieredRateLimiting: true,
+    enableDynamicAdjustment: true
+  }),
+  basic: createEnhancedLimiter({
+    windowMs: 15 * 60 * 1000,
+    max: 150,
+    endpoint: 'basic-tier',
+    enableUserRateLimiting: true,
+    enableTieredRateLimiting: true,
+    enableDynamicAdjustment: true
+  }),
+  premium: createEnhancedLimiter({
+    windowMs: 15 * 60 * 1000,
+    max: 250,
+    endpoint: 'premium-tier',
+    enableUserRateLimiting: true,
+    enableTieredRateLimiting: true,
+    enableDynamicAdjustment: true
+  }),
+  enterprise: createEnhancedLimiter({
+    windowMs: 15 * 60 * 1000,
+    max: 500,
+    endpoint: 'enterprise-tier',
+    enableUserRateLimiting: true,
+    enableTieredRateLimiting: true,
+    enableDynamicAdjustment: true
+  })
+};
 
 // Export all rate limiters as a single object for easier import
 export const rateLimiter = {
@@ -245,43 +337,57 @@ export const rateLimiter = {
   batch: batchLimiter,
   search: searchLimiter,
   export: exportLimiter,
-  sharing: sharingLimiter
+  sharing: sharingLimiter,
+  api: apiLimiter,
+  webhook: webhookLimiter,
+  auth: authLimiter,
+  passwordReset: passwordResetLimiter
 };
 
-// Dynamic rate limiter based on user tier
-export const createDynamicLimiter = (baseLimit: number, windowMs: number) => {
-  return rateLimit({
-    windowMs,
-    max: (req: Request) => {
-      const user = (req as any).user;
-      if (!user) return baseLimit;
-      
-      // Adjust limits based on user tier
-      switch (user.tier) {
-        case 'premium':
-          return baseLimit * 3;
-        case 'enterprise':
-          return baseLimit * 5;
-        default:
-          return baseLimit;
-      }
-    },
-    message: {
-      error: 'Too many requests',
-      message: 'Rate limit exceeded. Please try again later.',
-      retryAfter: `${Math.ceil(windowMs / 60000)} minutes`
-    },
-    keyGenerator: (req: Request) => {
-      return (req as any).user?.id || req.ip;
-    },
-    standardHeaders: true,
-    legacyHeaders: false
-  });
+// Utility function to create custom rate limiters
+export const createCustomRateLimiter = (options: {
+  windowMs: number;
+  max: number;
+  endpoint: string;
+  enableUserRateLimiting?: boolean;
+  enableTieredRateLimiting?: boolean;
+  enableDynamicAdjustment?: boolean;
+  message?: string;
+}) => {
+  return createEnhancedLimiter(options);
 };
 
-// Create rate limiters for different user tiers
-export const userTierLimiters = {
-  free: createDynamicLimiter(50, 15 * 60 * 1000),
-  premium: createDynamicLimiter(150, 15 * 60 * 1000),
-  enterprise: createDynamicLimiter(250, 15 * 60 * 1000)
+// Rate limit bypass middleware for emergency situations
+export const emergencyBypass = (req: Request, res: Response, next: NextFunction) => {
+  const bypassToken = req.headers['x-emergency-bypass'] as string;
+  const validToken = process.env.EMERGENCY_BYPASS_TOKEN;
+  
+  if (bypassToken && validToken && bypassToken === validToken) {
+    res.set('X-RateLimit-Bypass', 'emergency');
+    return next();
+  }
+  
+  // If no valid bypass token, continue with normal rate limiting
+  next();
+};
+
+// Rate limit status middleware
+export const rateLimitStatus = (req: Request, res: Response, next: NextFunction) => {
+  if (req.path === '/api/rate-limit/status') {
+    if (rateLimitService) {
+      return rateLimitService.getSystemMetrics()
+        .then(metrics => res.json(metrics))
+        .catch(error => {
+          console.error('Error getting rate limit metrics:', error);
+          res.status(500).json({ error: 'Failed to get rate limit metrics' });
+        });
+    } else {
+      return res.json({ 
+        error: 'Rate limit service not initialized',
+        status: 'basic_only'
+      });
+    }
+  }
+  
+  next();
 };
