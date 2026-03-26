@@ -2,6 +2,14 @@ import { Proof, IProof } from '../models/Proof';
 import { logger } from '../utils/logger';
 import { EventEmitter } from 'events';
 import crypto from 'crypto';
+import { eventService } from './events/EventService';
+import { 
+  ProofCreatedEvent, 
+  ProofVerifiedEvent, 
+  ProofUpdatedEvent, 
+  ProofDeletedEvent 
+} from '../events/EventTypes';
+import { EventUtils } from '../utils/eventUtils';
 
 /**
  * Proof Service - Handles all proof business logic
@@ -66,7 +74,40 @@ export class ProofService extends EventEmitter {
 
       await proof.save();
 
-      // Emit event for real-time updates
+      // Emit PROOF_CREATED event using the new event system
+      try {
+        const proofCreatedEvent = await eventService.createEvent<ProofCreatedEvent>(
+          'PROOF_CREATED',
+          {
+            proofId: proof.id,
+            proofType: proof.proofType,
+            creator: proof.createdBy,
+            commitment: proof.hash,
+            verificationKey: proof.hash, // Using hash as verification key for now
+            publicInputs: proof.eventData ? Object.values(proof.eventData) : [],
+            metadata: {
+              description: proof.description,
+              title: proof.title,
+              tags: proof.tags
+            }
+          },
+          {
+            source: 'proof-service',
+            correlationId: EventUtils.generateCorrelationId(),
+            metadata: {
+              operation: 'create',
+              timestamp: new Date(),
+              recipientAddress: proof.recipientAddress
+            }
+          }
+        );
+        
+        await eventService.publishEvent(proofCreatedEvent, `proof:${proof.id}`);
+      } catch (eventError) {
+        logger.warn('Failed to publish PROOF_CREATED event:', eventError);
+      }
+
+      // Keep the legacy event emitter for backward compatibility
       this.emit('proofCreated', proof);
 
       logger.info(`Proof created: ${proofId}`);
@@ -147,7 +188,35 @@ export class ProofService extends EventEmitter {
         details: verificationData.additionalData
       };
 
-      // Emit events
+      // Emit PROOF_VERIFIED event using the new event system
+      try {
+        const proofVerifiedEvent = await eventService.createEvent<ProofVerifiedEvent>(
+          'PROOF_VERIFIED',
+          {
+            proofId: proof.id,
+            verified: isValid,
+            verificationTime: proof.verifiedAt!.getTime() - proof.createdAt.getTime(),
+            verificationAttempts: proof.verificationHistory?.length || 1,
+            error: isValid ? undefined : 'Verification failed',
+            verifiedBy: verificationData.verifiedBy
+          },
+          {
+            source: 'proof-service',
+            correlationId: EventUtils.generateCorrelationId(),
+            metadata: {
+              operation: 'verify',
+              timestamp: new Date(),
+              verificationMethod: verificationData.verificationMethod
+            }
+          }
+        );
+        
+        await eventService.publishEvent(proofVerifiedEvent, `proof:${proof.id}`);
+      } catch (eventError) {
+        logger.warn('Failed to publish PROOF_VERIFIED event:', eventError);
+      }
+
+      // Keep the legacy event emitter for backward compatibility
       this.emit('proofVerified', { proof: proof.toObject(), verificationResult });
 
       logger.info(`Proof verification completed: ${proofId}, valid: ${isValid}`);
@@ -317,6 +386,42 @@ export class ProofService extends EventEmitter {
       ).lean();
 
       if (updatedProof) {
+        // Emit PROOF_UPDATED event using the new event system
+        try {
+          const proofUpdatedEvent = await eventService.createEvent<ProofUpdatedEvent>(
+            'PROOF_UPDATED',
+            {
+              proofId: updatedProof.id,
+              updates: {
+                proofType: updates.proofType,
+                commitment: updates.hash,
+                verificationKey: updates.hash,
+                publicInputs: updatedProof.eventData ? Object.values(updatedProof.eventData) : undefined,
+                metadata: {
+                  title: updates.title,
+                  description: updates.description,
+                  tags: updates.tags
+                }
+              },
+              updatedBy: userId
+            },
+            {
+              source: 'proof-service',
+              correlationId: EventUtils.generateCorrelationId(),
+              metadata: {
+                operation: 'update',
+                timestamp: new Date(),
+                changes: Object.keys(updates)
+              }
+            }
+          );
+          
+          await eventService.publishEvent(proofUpdatedEvent, `proof:${proofId}`);
+        } catch (eventError) {
+          logger.warn('Failed to publish PROOF_UPDATED event:', eventError);
+        }
+
+        // Keep the legacy event emitter for backward compatibility
         this.emit('proofUpdated', updatedProof);
         logger.info(`Proof updated: ${proofId}`);
       }
@@ -337,6 +442,31 @@ export class ProofService extends EventEmitter {
       const result = await Proof.deleteOne({ id: proofId, createdBy: userId });
 
       if (result.deletedCount > 0) {
+        // Emit PROOF_DELETED event using the new event system
+        try {
+          const proofDeletedEvent = await eventService.createEvent<ProofDeletedEvent>(
+            'PROOF_DELETED',
+            {
+              proofId,
+              deletedBy: userId,
+              reason: 'User initiated deletion'
+            },
+            {
+              source: 'proof-service',
+              correlationId: EventUtils.generateCorrelationId(),
+              metadata: {
+                operation: 'delete',
+                timestamp: new Date()
+              }
+            }
+          );
+          
+          await eventService.publishEvent(proofDeletedEvent, `proof:${proofId}`);
+        } catch (eventError) {
+          logger.warn('Failed to publish PROOF_DELETED event:', eventError);
+        }
+
+        // Keep the legacy event emitter for backward compatibility
         this.emit('proofDeleted', { proofId, userId });
         logger.info(`Proof deleted: ${proofId}`);
         return true;
